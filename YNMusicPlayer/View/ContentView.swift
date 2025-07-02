@@ -13,10 +13,12 @@ struct ContentView: View {
     let logger = Logger()
     @Environment(\.verticalSizeClass) var verticalSizeClass
     
+    @State private var searchQueryString: String = ""
+    
     @State private var youtubeViewToggle = false
     @State private var isExpanded = false
     @State var playerUUID: UUID = UUID()
-    
+    @State var musics: [Music] = []
     @Bindable var audioPlayer: AudioPlayer
     @Bindable var assetStore: MusicAssetStore
     
@@ -74,24 +76,30 @@ struct ContentView: View {
     
     var list: some View {
         List {
-            ForEach(assetStore.musics) { music in
-                MusicRowView(asset: music)
-                    .listRowBackground(assetStore.checkSet(music) ? Color.blue.opacity(0.4) : Color.gray.opacity(0.1))
+            ForEach($musics) { music in
+                MusicRowView(asset: music, logger: logger)
+                    .listRowBackground(assetStore.checkSet(music.wrappedValue) ? Color.blue.opacity(0.4) : Color.gray.opacity(0.1))
                     .onTapGesture {
-                        if assetStore.checkSet(music) {
+                        if assetStore.checkSet(music.wrappedValue) {
                             isExpanded = true
                         } else {
                             Task {
-                                assetStore.selectedMusic = music.fileName
-                                assetStore.selectedMusicAsset = music
-                                logger.debug("선택된 항목: \(music.originalName)")
-                                await audioPlayer.set(music)
+                                assetStore.selectedMusic = music.wrappedValue.fileName
+                                assetStore.selectedMusicAsset = music.wrappedValue
+                                logger.debug("선택된 항목: \(music.wrappedValue.originalName)")
+                                await audioPlayer.set(music.wrappedValue)
                             }
                         }
                     }
             }
             .onDelete(perform: deleteItems)
         }
+        .onChange(of: searchQueryString, initial: true) { oldValue, newValue in
+            Task.detached(priority: .userInitiated) {
+                await search(contains: newValue)
+            }
+        }
+        .searchable(text: $searchQueryString)
     }
     
     var player: some View {
@@ -123,8 +131,47 @@ struct ContentView: View {
         logger.debug("선택된 항목: \(music.originalName)")
         await audioPlayer.set(music)
     }
+    
+    private func search(contains query: String) async {
+        if query.isEmpty {
+            await MainActor.run {
+                musics = assetStore.musics
+            }
+            return
+        }
+        
+        do {
+            let searchResult = try await self.assetStore.musics.concurrentAsyncFilter { @Sendable music in
+                try await MetadataStore.shared.loadIfNeeded(for: music).title.localizedStandardContains(query)
+            }
+            await MainActor.run {
+                musics = searchResult
+            }
+        } catch {
+            logger.error("🔴 검색 실패: \(error)")
+        }
+    }
 }
 
 //#Preview {
 //    ContentView(store: MusicAssetStore.shared)
 //}
+
+extension Array where Element: Sendable {
+    func concurrentAsyncFilter(_ isIncluded: @Sendable @escaping (Element) async throws -> Bool) async throws -> [Element] {
+        try await withThrowingTaskGroup(of: (Element?).self) { group in
+            for element in self {
+                group.addTask {
+                    return try await isIncluded(element) ? element : nil
+                }
+            }
+            var result: [Element] = []
+            for try await maybeElement in group {
+                if let element = maybeElement {
+                    result.append(element)
+                }
+            }
+            return result
+        }
+    }
+}
